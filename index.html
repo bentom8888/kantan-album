@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#1f5fa8">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="画像アルバム">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="referrer" content="no-referrer">
+<title>かんたん画像アルバム</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<style>
+:root{--bar:#1f5fa8;--bg:#eef1f5;--ink:#202631;--sub:#5a6574;--line:#d7dde5;--warn:#9a3b00;font-family:system-ui,-apple-system,"Segoe UI","Hiragino Sans","Yu Gothic",Meiryo,sans-serif;color:var(--ink);background:var(--bg)}
+*{box-sizing:border-box}[hidden]{display:none!important}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg)}
+body{display:flex;flex-direction:column;height:100dvh}
+header{flex:none;background:var(--bar);color:#fff;padding:calc(6px + env(safe-area-inset-top)) calc(10px + env(safe-area-inset-right)) 6px calc(10px + env(safe-area-inset-left));display:flex;align-items:center;gap:8px}
+#status{flex:1;min-width:0;font-size:12px;line-height:1.35;white-space:pre-line;overflow:hidden;max-height:3.2em}
+#status.warn{color:#ffe2b8}
+button{font:inherit;font-size:14px;border:1px solid rgba(255,255,255,.7);background:rgba(255,255,255,.12);color:#fff;border-radius:8px;padding:7px 11px;white-space:nowrap}
+button:disabled{opacity:.5}
+#login{background:#fff;color:var(--bar);font-weight:700}
+#menuPanel{position:absolute;right:calc(8px + env(safe-area-inset-right));top:calc(48px + env(safe-area-inset-top));z-index:10;background:#fff;color:var(--ink);border:1px solid var(--line);border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.18);padding:12px;width:min(320px,calc(100vw - 16px));font-size:13px;line-height:1.6}
+#menuPanel button{display:block;width:100%;margin-top:8px;color:var(--ink);border-color:var(--line);background:#f6f8fb;text-align:left}
+#newBar{flex:none;background:#fff4d6;color:#5c4300;padding:8px 12px;font-size:14px;display:flex;align-items:center;gap:10px;border-bottom:1px solid #ecd9a2}
+#newBar button{color:#5c4300;border-color:#c9a94f;background:#fff}
+main{flex:1;min-height:0;position:relative}
+#view{border:0;width:100%;height:100%;display:block;background:var(--bg)}
+#help{padding:24px 18px;max-width:640px;margin:auto;line-height:1.8;font-size:15px}
+#help h1{font-size:20px;margin:0 0 12px}
+#help .note{color:var(--sub);font-size:13px}
+#progress{position:absolute;left:0;right:0;top:0;height:3px;background:transparent}
+#progress i{display:block;height:100%;width:0;background:#f0a020;transition:width .2s}
+</style>
+</head>
+<body>
+<header>
+  <div id="status">起動中…</div>
+  <button id="login" type="button" hidden>ログイン</button>
+  <button id="refresh" type="button">更新</button>
+  <button id="menu" type="button" aria-label="メニュー">…</button>
+</header>
+<div id="menuPanel" hidden>
+  <div id="info">情報を読み込み中…</div>
+  <button id="restore" type="button">ひとつ前に取得したアルバムを表示</button>
+  <button id="logout" type="button">ログアウト（端末の画像は残ります）</button>
+  <button id="closeMenu" type="button">閉じる</button>
+</div>
+<div id="newBar" hidden><span>PCで更新された新しいアルバムがあります。</span><button id="showNew" type="button">表示する</button></div>
+<main>
+  <div id="progress"><i></i></div>
+  <iframe id="view" title="アルバム" hidden
+    sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"></iframe>
+  <div id="help">
+    <h1>かんたん画像アルバム</h1>
+    <p>PCで保存したチャート画像を、OneDriveから取り込んで表示します。</p>
+    <p>初回は、インターネットにつながった状態で上の「ログイン」を押し、OneDriveで使っているMicrosoftアカウントでログインしてください。</p>
+    <p class="note">一度取り込んだ画像は端末に保存され、オフラインでも見られます。</p>
+  </div>
+</main>
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
