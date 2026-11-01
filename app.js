@@ -1,6 +1,6 @@
 "use strict";
 /*
- かんたん画像アルバム スマホ版 v0.7.0
+ かんたん画像アルバム スマホ版 v0.7.1
  - PC版v0.6.0が作る「スマホで見る.html」をOneDriveから読み取り専用(Files.Read)で取得
  - 取得したHTMLは端末(IndexedDB)に保存し、オフラインでも表示
  - 取得に失敗しても、保存済みのアルバムは消さない
@@ -21,7 +21,7 @@ const K = {
   loggedOut: "kaa.loggedOut"
 };
 
-let accessToken = "", expiresAt = 0, shownKey = "", blobUrl = "", syncing = false, pending = null;
+let accessToken = "", expiresAt = 0, shownKey = "", rendered = false, showingPrevious = false, syncing = false, pending = null;
 
 /* ---------- 小道具 ---------- */
 function ls(key, value) {
@@ -30,16 +30,16 @@ function ls(key, value) {
     if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value);
   } catch { return null; }
 }
-function status(msg, warn = false) { const s = $("status"); s.textContent = msg; s.classList.toggle("warn", warn); }
+function status(msg, warn = false) { const s = $("appStatus"); s.textContent = msg; s.classList.toggle("warn", warn); }
 function fmt(t) { try { return new Date(t).toLocaleString("ja-JP", {month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit"}); } catch { return ""; } }
 function mb(n) { return (n / 1048576).toFixed(1) + "MB"; }
-function progress(p) { $("progress").firstElementChild.style.width = p == null ? "0" : Math.round(p * 100) + "%"; }
+function progress(p) { $("appProgress").firstElementChild.style.width = p == null ? "0" : Math.round(p * 100) + "%"; }
 function b64url(bytes) { let s = ""; bytes.forEach(b => s += String.fromCharCode(b)); return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
 function random() { return b64url(crypto.getRandomValues(new Uint8Array(32))); }
 async function sha256(s) { return b64url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)))); }
 function clientReady() { return cfg.clientId && !String(cfg.clientId).startsWith("REPLACE_"); }
 function loggedIn() { return !!(accessToken || ls(K.refresh)); }
-function setLoginButton() { $("login").hidden = loggedIn(); }
+function setLoginButton() { $("appLogin").hidden = loggedIn(); }
 
 /* ---------- 端末内の保存（IndexedDB） ---------- */
 function db() {
@@ -79,14 +79,29 @@ async function dbTouch(checkedAt) {
 }
 
 /* ---------- 表示 ---------- */
-function display(value) {
+// 「スマホで見る.html」の中から画像・コメントのデータ（ALBUM_DATA）だけを JSON として取り出す。
+// HTML内のプログラムは実行しない。表示はアプリ内の album-view.js（PC版と同じ画面）が行う。
+function extractData(html) {
+  const mark = "const ALBUM_DATA=", i = html.indexOf(mark);
+  const end = i < 0 ? -1 : html.indexOf(";\nconst $=id=>", i);
+  if (i < 0 || end < 0) throw Error("アルバムのデータが見つかりません");
+  const data = JSON.parse(html.slice(i + mark.length, end));
+  if (!data || !Array.isArray(data.items)) throw Error("アルバムのデータ形式が違います");
+  return data;
+}
+// 枠(iframe)を使わずにページへ直接表示する（iPadで枠の中がスクロールできない問題の対策）。
+// 表示部分は1回しか組み立てられないため、別の版に切り替えるときはページを読み直す。
+function display(value, which = "latest") {
   if (!value || !value.html) return;
-  if (blobUrl) URL.revokeObjectURL(blobUrl);
-  blobUrl = URL.createObjectURL(new Blob([value.html], {type: "text/html;charset=utf-8"}));
-  // sandbox（allow-same-origin なし）で表示するため、アルバム側からログイン情報には触れられない
-  $("view").src = blobUrl; $("view").hidden = false; $("help").hidden = true;
+  if (rendered) { try { sessionStorage.setItem("kaa.show", which); } catch {} location.reload(); return; }
+  const data = extractData(value.html);
+  const view = window.KAA_VIEW;
+  const style = document.createElement("style"); style.textContent = view.css; document.head.appendChild(style);
+  const root = $("albumRoot"); root.innerHTML = view.html; root.hidden = false; $("appHelp").hidden = true;
+  view.start(data);
+  rendered = true;
   shownKey = value.eTag || String(value.at);
-  $("newBar").hidden = true; pending = null;
+  $("appNewBar").hidden = true; pending = null;
 }
 function describe(v) { return "PCで更新：" + fmt(v.modifiedAt || v.at) + "（" + mb(v.size || v.html.length) + "）"; }
 
@@ -168,7 +183,7 @@ async function download(url, auth, expected) {
 }
 async function sync(reason) {
   if (syncing) return; if (!navigator.onLine) { status("オフラインです。端末に保存したアルバムを表示しています。", true); return; }
-  syncing = true; $("refresh").disabled = true;
+  syncing = true; $("appRefresh").disabled = true;
   try {
     status("OneDriveを確認中…");
     let token = await getToken(reason !== "manual-no-redirect");
@@ -185,7 +200,7 @@ async function sync(reason) {
     const now = Date.now();
     if (cur && cur.eTag === eTag) {
       await dbTouch(now);
-      if (!shownKey) display(cur);
+      if (!shownKey || showingPrevious) display(cur);
       status("最新です（" + describe(cur) + "／確認 " + fmt(now) + "）");
       return;
     }
@@ -194,16 +209,18 @@ async function sync(reason) {
     try { html = dl ? await download(dl, null, item.size) : await download(GRAPH + path + ":/content", token, item.size); }
     catch (e) { if (!dl) throw e; html = await download(GRAPH + path + ":/content", token, item.size); }
     const head = html.slice(0, 2000).toLowerCase();
-    if (!(head.includes("<!doctype html") || head.includes("<html")) || !html.includes("ALBUM_DATA")) throw Error("取得したファイルがアルバムの形式ではありません。保存済みのアルバムはそのまま残しています。");
+    let okFormat = head.includes("<!doctype html") || head.includes("<html");
+    try { extractData(html); } catch { okFormat = false; }
+    if (!okFormat) throw Error("取得したファイルがアルバムの形式ではありません。保存済みのアルバムはそのまま残しています。");
     const value = {html, at: now, checkedAt: now, eTag, modifiedAt: item.lastModifiedDateTime || "", size: item.size || html.length};
     await dbSaveNew(value);
     try { if (navigator.storage && navigator.storage.persist) await navigator.storage.persist(); } catch {}
     if (!shownKey || reason === "launch" || reason === "login" || reason === "manual") { display(value); status("最新のアルバムを取り込みました（" + describe(value) + "）"); }
-    else { pending = value; $("newBar").hidden = false; status("新しいアルバムを取り込みました。上の「表示する」で切り替えます。"); }
+    else { pending = value; $("appNewBar").hidden = false; status("新しいアルバムを取り込みました。上の「表示する」で切り替えます。"); }
   } catch (err) {
     status("更新できませんでした：" + err.message + "\n保存済みのアルバムはそのまま見られます。", true);
   } finally {
-    syncing = false; $("refresh").disabled = false; progress(null); setLoginButton();
+    syncing = false; $("appRefresh").disabled = false; progress(null); setLoginButton();
   }
 }
 
@@ -212,29 +229,28 @@ async function openMenu() {
   const cur = await dbGet("latest").catch(() => null), prev = await dbGet("previous").catch(() => null);
   let est = ""; try { const e = await navigator.storage.estimate(); est = "端末の使用量：" + mb(e.usage || 0); } catch {}
   let persisted = ""; try { persisted = (await navigator.storage.persisted()) ? "（削除されにくい保存）" : ""; } catch {}
-  $("info").textContent =
+  $("appInfo").textContent =
     "スマホ版 v" + (cfg.appVersion || "") + "\n" +
     (cur ? "表示中のデータ：" + describe(cur) + "\n最終確認：" + fmt(cur.checkedAt || cur.at) : "保存済みのアルバムはありません") + "\n" +
     (prev ? "ひとつ前のデータ：" + fmt(prev.modifiedAt || prev.at) : "ひとつ前のデータ：なし") + "\n" +
     "ログイン：" + (loggedIn() ? (ls(K.hint) || "済み") : "未ログイン") + "\n" + est + persisted;
-  $("info").style.whiteSpace = "pre-line";
-  $("restore").disabled = !prev;
-  $("menuPanel").hidden = false;
+  $("appInfo").style.whiteSpace = "pre-line";
+  $("appRestore").disabled = !prev;
+  $("appMenuPanel").hidden = false;
 }
 
 async function init() {
-  $("login").addEventListener("click", () => { ls(K.loggedOut, null); startLogin(false); });
-  $("refresh").addEventListener("click", () => sync("manual"));
-  $("menu").addEventListener("click", () => $("menuPanel").hidden ? openMenu() : ($("menuPanel").hidden = true));
-  $("closeMenu").addEventListener("click", () => $("menuPanel").hidden = true);
-  $("showNew").addEventListener("click", () => { if (pending) { display(pending); status("最新のアルバムを表示しています（" + describe(pending) + "）"); } });
-  $("restore").addEventListener("click", async () => {
+  $("appLogin").addEventListener("click", () => { ls(K.loggedOut, null); startLogin(false); });
+  $("appRefresh").addEventListener("click", () => sync("manual"));
+  $("appMenu").addEventListener("click", () => $("appMenuPanel").hidden ? openMenu() : ($("appMenuPanel").hidden = true));
+  $("appCloseMenu").addEventListener("click", () => $("appMenuPanel").hidden = true);
+  $("appShowNew").addEventListener("click", () => { if (pending) { display(pending); status("最新のアルバムを表示しています（" + describe(pending) + "）"); } });
+  $("appRestore").addEventListener("click", async () => {
     const prev = await dbGet("previous"); if (!prev) return;
-    display(prev); $("menuPanel").hidden = true; status("ひとつ前のアルバムを表示中です（" + describe(prev) + "）。「更新」で最新に戻ります。", true);
-    shownKey = "previous";
+    $("appMenuPanel").hidden = true; display(prev, "previous");
   });
-  $("logout").addEventListener("click", () => {
-    accessToken = ""; expiresAt = 0; ls(K.refresh, null); ls(K.loggedOut, "1"); $("menuPanel").hidden = true; setLoginButton();
+  $("appLogout").addEventListener("click", () => {
+    accessToken = ""; expiresAt = 0; ls(K.refresh, null); ls(K.loggedOut, "1"); $("appMenuPanel").hidden = true; setLoginButton();
     status("ログアウトしました。端末に保存したアルバムは引き続き見られます。");
   });
 
@@ -242,6 +258,13 @@ async function init() {
 
   // 1) まず端末に保存済みのアルバムをすぐ表示（オフラインでも見られる）
   try {
+    let which = ""; try { which = sessionStorage.getItem("kaa.show") || ""; sessionStorage.removeItem("kaa.show"); } catch {}
+    const prev = which === "previous" ? await dbGet("previous") : null;
+    if (prev) {
+      display(prev); showingPrevious = true;
+      status("ひとつ前のアルバムを表示中です（" + describe(prev) + "）。「更新」で最新に戻ります。", true);
+      return wireResume();
+    }
     const cached = await dbGet("latest");
     if (cached) { display(cached); status("保存済みのアルバムを表示中（" + describe(cached) + "）"); }
     else status("端末に保存されたアルバムはまだありません。");
@@ -258,9 +281,12 @@ async function init() {
   else if (loggedIn() || (ls(K.hint) && !ls(K.loggedOut))) await sync("launch");
   else if (!shownKey) status("初回は「ログイン」を押してください。");
 
-  // 3) アプリに戻ってきたとき・ネットに再接続したときにも確認
+  wireResume();
+}
+// 3) アプリに戻ってきたとき・ネットに再接続したときにも確認
+function wireResume() {
   let lastCheck = Date.now();
-  const again = () => { if (document.hidden || !navigator.onLine || !loggedIn()) return; if (Date.now() - lastCheck < 60000) return; lastCheck = Date.now(); sync("resume"); };
+  const again = () => { if (document.hidden || !navigator.onLine || !loggedIn() || showingPrevious) return; if (Date.now() - lastCheck < 60000) return; lastCheck = Date.now(); sync("resume"); };
   document.addEventListener("visibilitychange", again);
   window.addEventListener("online", () => { lastCheck = 0; again(); });
   window.addEventListener("offline", () => status("オフラインになりました。保存済みのアルバムを表示しています。", true));

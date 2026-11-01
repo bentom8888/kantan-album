@@ -1,8 +1,8 @@
-// かんたん画像アルバム スマホ版 v0.7.0 サービスワーカー
+// かんたん画像アルバム スマホ版 v0.7.1 サービスワーカー
 // アプリの外枠（画面・プログラム）を端末に保存し、オフラインでも起動できるようにする。
 // アルバムの画像データはここでは扱わない（app.js が IndexedDB に保存）。
-const CACHE = "kaa-shell-0.7.0";
-const SHELL = ["./", "./index.html", "./app.js", "./config.js", "./manifest.webmanifest",
+const CACHE = "kaa-shell-0.7.1";
+const SHELL = ["./", "./index.html", "./app.js", "./album-view.js", "./config.js", "./manifest.webmanifest",
   "./icon-192.png", "./icon-512.png", "./apple-touch-icon.png"];
 
 self.addEventListener("install", e => {
@@ -21,7 +21,9 @@ self.addEventListener("fetch", e => {
     const cache = await caches.open(CACHE);
     const key = req.mode === "navigate" ? "./index.html" : req;
     const cached = await cache.match(key, {ignoreSearch: true});
-    const network = fetch(req).then(res => {
+    // オフライン中は通信しない（iPadで「機内モードをオフに…」の案内が出るのを防ぐ）
+    const offline = self.navigator && self.navigator.onLine === false;
+    const network = offline ? Promise.resolve(null) : fetch(req).then(res => {
       if (res && res.ok && res.type === "basic") cache.put(key, res.clone());
       return res;
     }).catch(() => null);
