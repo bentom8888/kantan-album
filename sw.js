@@ -1,7 +1,7 @@
-// かんたん画像アルバム スマホ版 v0.7.2 サービスワーカー
+// かんたん画像アルバム スマホ版 v0.7.3 サービスワーカー
 // アプリの外枠（画面・プログラム）を端末に保存し、オフラインでも起動できるようにする。
 // アルバムの画像データはここでは扱わない（app.js が IndexedDB に保存）。
-const CACHE = "kaa-shell-0.7.2";
+const CACHE = "kaa-shell-0.7.3";
 const SHELL = ["./", "./index.html", "./app.js", "./album-view.js", "./config.js", "./manifest.webmanifest",
   "./icon-192.png", "./icon-512.png", "./apple-touch-icon.png"];
 
