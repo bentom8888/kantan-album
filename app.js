@@ -1,6 +1,6 @@
 "use strict";
 /*
- かんたん画像アルバム スマホ版 v0.7.1
+ かんたん画像アルバム スマホ版 v0.8.0
  - PC版v0.6.0が作る「スマホで見る.html」をOneDriveから読み取り専用(Files.Read)で取得
  - 取得したHTMLは端末(IndexedDB)に保存し、オフラインでも表示
  - 取得に失敗しても、保存済みのアルバムは消さない
@@ -21,6 +21,7 @@ const K = {
   loggedOut: "kaa.loggedOut"
 };
 
+let carriedMsg = "";
 let accessToken = "", expiresAt = 0, shownKey = "", rendered = false, showingPrevious = false, syncing = false, pending = null;
 
 /* ---------- 小道具 ---------- */
@@ -44,8 +45,11 @@ function setLoginButton() { $("appLogin").hidden = loggedIn(); }
 /* ---------- 端末内の保存（IndexedDB） ---------- */
 function db() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open("kantan-album-mobile", 2);
-    req.onupgradeneeded = () => { if (!req.result.objectStoreNames.contains("snapshot")) req.result.createObjectStore("snapshot"); };
+    const req = indexedDB.open("kantan-album-mobile", 3);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains("snapshot")) req.result.createObjectStore("snapshot");
+      if (!req.result.objectStoreNames.contains("images")) req.result.createObjectStore("images");   // v0.8.0: 画像1枚ずつ
+    };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
@@ -68,6 +72,58 @@ async function dbSaveNew(value) {
     tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error || Error("保存が中断されました"));
   });
 }
+// v0.8.0: 最新の版を「ひとつ前」に送らずに上書きする（同じ一覧表で、足りなかった画像を補ったとき用）
+async function dbPutLatest(value) {
+  const d = await db();
+  return new Promise((resolve, reject) => {
+    const tx = d.transaction("snapshot", "readwrite"); tx.objectStore("snapshot").put(value, "latest");
+    tx.oncomplete = () => { d.close(); resolve(); }; tx.onerror = () => reject(tx.error);
+  });
+}
+/* ---------- v0.8.0: 画像1枚ずつの保存 ---------- */
+async function imgKeys() {
+  const d = await db();
+  return new Promise((resolve, reject) => {
+    const tx = d.transaction("images", "readonly"); const r = tx.objectStore("images").getAllKeys();
+    r.onsuccess = () => resolve(new Set(r.result)); r.onerror = () => reject(r.error); tx.oncomplete = () => d.close();
+  });
+}
+async function imgPut(key, blob) {
+  const d = await db();
+  return new Promise((resolve, reject) => {
+    const tx = d.transaction("images", "readwrite"); tx.objectStore("images").put(blob, key);
+    tx.oncomplete = () => { d.close(); resolve(); }; tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error || Error("画像を保存できません（端末の空き容量を確認してください）"));
+  });
+}
+async function imgGetMany(keys) {
+  const d = await db(); const out = new Map();
+  return new Promise((resolve, reject) => {
+    const tx = d.transaction("images", "readonly"); const st = tx.objectStore("images");
+    for (const key of keys) { const r = st.get(key); r.onsuccess = () => { if (r.result) out.set(key, r.result); }; }
+    tx.oncomplete = () => { d.close(); resolve(out); }; tx.onerror = () => reject(tx.error);
+  });
+}
+async function imgDelete(keys) {
+  if (!keys.length) return;
+  const d = await db();
+  return new Promise((resolve, reject) => {
+    const tx = d.transaction("images", "readwrite"); const st = tx.objectStore("images");
+    for (const key of keys) st.delete(key);
+    tx.oncomplete = () => { d.close(); resolve(); }; tx.onerror = () => reject(tx.error);
+  });
+}
+function indexKeys(index) {
+  return [...new Set((index?.items || []).flatMap((item) => (item.images || []).map((image) => image.key))
+    .filter((key) => /^[0-9a-f]{16,64}$/.test(String(key))))];
+}
+// 最新とひとつ前のどちらからも使われていない画像を端末から消す
+async function pruneImages() {
+  const latest = await dbGet("latest"), previous = await dbGet("previous");
+  const keep = new Set([...(latest?.kind === "v2" ? indexKeys(latest.index) : []), ...(previous?.kind === "v2" ? indexKeys(previous.index) : [])]);
+  const all = await imgKeys();
+  await imgDelete([...all].filter((key) => !keep.has(key)));
+}
+
 async function dbTouch(checkedAt) {
   const cur = await dbGet("latest"); if (!cur) return;
   cur.checkedAt = checkedAt;
@@ -91,10 +147,25 @@ function extractData(html) {
 }
 // 枠(iframe)を使わずにページへ直接表示する（iPadで枠の中がスクロールできない問題の対策）。
 // 表示部分は1回しか組み立てられないため、別の版に切り替えるときはページを読み直す。
+async function buildData(value) {
+  if (value.kind !== "v2") return extractData(value.html);
+  const index = value.index, blobs = await imgGetMany(indexKeys(index)), urls = new Map();
+  for (const [key, blob] of blobs) urls.set(key, URL.createObjectURL(blob));
+  return {...index, items: (index.items || []).map((item) => ({...item,
+    images: (item.images || []).map((image) => ({src: urls.get(image.key) || "", memo: image.memo || "", pageUrl: image.pageUrl || ""}))}))};
+}
 function display(value, which = "latest") {
-  if (!value || !value.html) return;
-  if (rendered) { try { sessionStorage.setItem("kaa.show", which); } catch {} location.reload(); return; }
-  const data = extractData(value.html);
+  return displayAsync(value, which).catch((e) => status("表示できませんでした：" + e.message, true));
+}
+async function displayAsync(value, which) {
+  if (!value || (!value.html && value.kind !== "v2")) return;
+  if (rendered) {
+    // 画面を読み直す前に、今のお知らせを引き継ぐ（読み直したあとも「○枚を取り込みました」が見えるように）
+    try { sessionStorage.setItem("kaa.show", which); sessionStorage.setItem("kaa.msg", $("appStatus").textContent); } catch {}
+    location.reload(); return;
+  }
+  const data = await buildData(value);
+  if (rendered) return;
   const view = window.KAA_VIEW;
   const style = document.createElement("style"); style.textContent = view.css; document.head.appendChild(style);
   const root = $("albumRoot"); root.innerHTML = view.html; root.hidden = false; $("appHelp").hidden = true;
@@ -103,7 +174,10 @@ function display(value, which = "latest") {
   shownKey = value.eTag || String(value.at);
   $("appNewBar").hidden = true; pending = null;
 }
-function describe(v) { return "PCで更新：" + fmt(v.modifiedAt || v.at) + "（" + mb(v.size || v.html.length) + "）"; }
+function describe(v) {
+  if (v.kind === "v2") return "PCで更新：" + fmt(v.modifiedAt || v.at) + "（" + (v.count || 0) + "枚）";
+  return "PCで更新：" + fmt(v.modifiedAt || v.at) + "（" + mb(v.size || v.html.length) + "）";
+}
 
 /* ---------- ログイン ---------- */
 async function startLogin(silent) {
@@ -189,6 +263,11 @@ async function sync(reason) {
     let token = await getToken(reason !== "manual-no-redirect");
     if (token === "redirect") return;
     if (!token) { setLoginButton(); status(shownKey ? "ログインが切れました。「ログイン」で最新に更新できます。" : "「ログイン」を押してください。", true); return; }
+    // v0.8.0: PC版v0.7.0以降が作る「一覧表＋画像1枚ずつ」があれば、そちらで差分だけ取り込む
+    const v2 = await syncV2(reason);
+    if (v2 === "redirect" || v2 === true) return;
+    token = await getToken(true);
+    if (!token || token === "redirect") return;
     const path = "/me/drive/root:/" + String(cfg.filePath).split("/").map(encodeURIComponent).join("/");
     let res = await graphGet(path, token);
     if (res.status === 401) { accessToken = ""; token = await getToken(true); if (!token || token === "redirect") return; res = await graphGet(path, token); }
@@ -201,7 +280,8 @@ async function sync(reason) {
     if (cur && cur.eTag === eTag) {
       await dbTouch(now);
       if (!shownKey || showingPrevious) display(cur);
-      status("最新です（" + describe(cur) + "／確認 " + fmt(now) + "）");
+      status(carriedMsg || ("最新です（" + describe(cur) + "／確認 " + fmt(now) + "）"));
+      carriedMsg = "";
       return;
     }
     let html;
@@ -215,13 +295,108 @@ async function sync(reason) {
     const value = {html, at: now, checkedAt: now, eTag, modifiedAt: item.lastModifiedDateTime || "", size: item.size || html.length};
     await dbSaveNew(value);
     try { if (navigator.storage && navigator.storage.persist) await navigator.storage.persist(); } catch {}
-    if (!shownKey || reason === "launch" || reason === "login" || reason === "manual") { display(value); status("最新のアルバムを取り込みました（" + describe(value) + "）"); }
+    if (!shownKey || reason === "launch" || reason === "login" || reason === "manual") { status("最新のアルバムを取り込みました（" + describe(value) + "）"); display(value); }
     else { pending = value; $("appNewBar").hidden = false; status("新しいアルバムを取り込みました。上の「表示する」で切り替えます。"); }
   } catch (err) {
     status("更新できませんでした：" + err.message + "\n保存済みのアルバムはそのまま見られます。", true);
   } finally {
     syncing = false; $("appRefresh").disabled = false; progress(null); setLoginButton();
   }
+}
+
+/* ---------- v0.8.0: 差分取り込み ---------- */
+function dataPath() {
+  const dir = String(cfg.dataPath || String(cfg.filePath).split("/").slice(0, -1).concat("mobile-data").join("/"));
+  return "/me/drive/root:/" + dir.split("/").map(encodeURIComponent).join("/");
+}
+// ログイン付きでGraphを呼ぶ（期限切れなら1回だけ取り直す）。自動再ログインに進んだときは null
+async function authed(url) {
+  let token = await getToken(true);
+  if (token === "redirect") return null;
+  if (!token) throw Error("ログインが必要です");
+  let res = await fetch(url, {headers: {Authorization: "Bearer " + token}, cache: "no-store"});
+  if (res.status === 401) {
+    accessToken = ""; token = await getToken(true);
+    if (!token || token === "redirect") return null;
+    res = await fetch(url, {headers: {Authorization: "Bearer " + token}, cache: "no-store"});
+  }
+  return res;
+}
+// OneDriveの img フォルダにある画像ファイルの一覧（名前 → ダウンロード用URL）
+async function listImageFiles(base) {
+  const urls = new Map();
+  let next = GRAPH + base + "/img:/children?$top=999";
+  while (next) {
+    const res = await authed(next);
+    if (!res) return null;
+    if (res.status === 404) return urls;
+    if (!res.ok) throw Error("画像の一覧を取得できません（HTTP " + res.status + "）");
+    const data = await res.json();
+    for (const file of data.value || []) if (file.name && file["@microsoft.graph.downloadUrl"]) urls.set(file.name, file["@microsoft.graph.downloadUrl"]);
+    next = data["@odata.nextLink"] || "";
+  }
+  return urls;
+}
+// 戻り値: true=処理した / false=一覧表が無い（これまでの方式へ） / "redirect"=自動再ログインへ
+async function syncV2(reason) {
+  const base = dataPath();
+  const res = await authed(GRAPH + base + "/mobile-index.json");
+  if (!res) return "redirect";
+  if (res.status === 404) return false;
+  if (!res.ok) throw Error("OneDriveの確認に失敗しました（HTTP " + res.status + "）");
+  const item = await res.json();
+  const eTag = item.eTag || item.cTag || item.lastModifiedDateTime;
+  const cur = await dbGet("latest");
+  const now = Date.now();
+  const sameIndex = cur && cur.kind === "v2" && cur.eTag === eTag;
+  let index;
+  if (sameIndex) index = cur.index;
+  else {
+    const dl = item["@microsoft.graph.downloadUrl"];
+    const text = dl ? await download(dl, null, item.size) : await (await authed(GRAPH + base + "/mobile-index.json:/content")).text();
+    index = JSON.parse(text);
+    if (!index || index.version !== 2 || !Array.isArray(index.items)) throw Error("一覧表の形式が違います。保存済みのアルバムはそのまま残しています。");
+  }
+  const needed = indexKeys(index), have = await imgKeys();
+  const missing = needed.filter((key) => !have.has(key));
+  if (sameIndex && !missing.length) {
+    await dbTouch(now);
+    if (!shownKey || showingPrevious) display(cur);
+    status(carriedMsg || ("最新です（" + describe(cur) + "／確認 " + fmt(now) + "）"));
+    carriedMsg = "";
+    return true;
+  }
+  let notYet = 0;
+  if (missing.length) {
+    status("新しい画像を確認中…");
+    const urls = await listImageFiles(base);
+    if (!urls) return "redirect";
+    let done = 0;
+    for (const key of missing) {
+      const url = urls.get(key + ".jpg");
+      if (!url) { notYet++; continue; }
+      done++;
+      status("新しい画像を取り込み中… " + done + " / " + (missing.length) + "枚");
+      progress(done / missing.length);
+      const r = await fetch(url, {cache: "no-store"});
+      if (!r.ok) throw Error("画像を取り込めませんでした（HTTP " + r.status + "）。取り込めた分は保存してあり、次回は続きから取り込みます。");
+      await imgPut(key, await r.blob());
+    }
+  }
+  // PCからOneDriveへの同期が途中の画像があるときは、表示中のアルバムをそのまま使う（初回だけは、そろっている分で表示）
+  if (notYet && cur) {
+    status("PCからOneDriveへの同期がまだの画像が" + notYet + "枚あります。少し待ってから「更新」を押してください。", true);
+    return true;
+  }
+  const value = {kind: "v2", index, at: now, checkedAt: now, eTag, modifiedAt: item.lastModifiedDateTime || "", count: needed.length};
+  if (sameIndex) await dbPutLatest(value); else await dbSaveNew(value);
+  try { if (navigator.storage && navigator.storage.persist) await navigator.storage.persist(); } catch {}
+  await pruneImages().catch(() => {});
+  const msg = (missing.length ? "新しい画像" + (missing.length - notYet) + "枚を取り込みました" : "最新のアルバムを取り込みました") +
+    "（" + describe(value) + "）" + (notYet ? "\n同期待ちの画像が" + notYet + "枚あります。少し待ってから「更新」を押してください。" : "");
+  if (!shownKey || reason === "launch" || reason === "login" || reason === "manual" || showingPrevious) { status(msg, !!notYet); display(value); }
+  else { pending = value; $("appNewBar").hidden = false; status("新しいアルバムを取り込みました。上の「表示する」で切り替えます。"); }
+  return true;
 }
 
 /* ---------- メニュー ---------- */
@@ -265,8 +440,9 @@ async function init() {
       status("ひとつ前のアルバムを表示中です（" + describe(prev) + "）。「更新」で最新に戻ります。", true);
       return wireResume();
     }
+    try { carriedMsg = sessionStorage.getItem("kaa.msg") || ""; sessionStorage.removeItem("kaa.msg"); } catch {}
     const cached = await dbGet("latest");
-    if (cached) { display(cached); status("保存済みのアルバムを表示中（" + describe(cached) + "）"); }
+    if (cached) { await display(cached); status(carriedMsg || ("保存済みのアルバムを表示中（" + describe(cached) + "）")); }
     else status("端末に保存されたアルバムはまだありません。");
   } catch (e) { status("端末の保存データを読めません：" + e.message, true); }
 
