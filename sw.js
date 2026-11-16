@@ -1,12 +1,13 @@
-// かんたん画像アルバム スマホ版 v0.8.0 サービスワーカー
+// かんたん画像アルバム スマホ版 v0.8.1 サービスワーカー
 // アプリの外枠（画面・プログラム）を端末に保存し、オフラインでも起動できるようにする。
 // アルバムの画像データはここでは扱わない（app.js が IndexedDB に保存）。
-const CACHE = "kaa-shell-0.8.0";
+const CACHE = "kaa-shell-0.8.1";
 const SHELL = ["./", "./index.html", "./app.js", "./album-view.js", "./config.js", "./manifest.webmanifest",
   "./icon-192.png", "./icon-512.png", "./apple-touch-icon.png"];
 
 self.addEventListener("install", e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  // v0.8.1: GitHub側の一時保存（最大10分）を使わず、必ず最新のファイルを取りに行く
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL.map(u => new Request(u, {cache: "reload"})))).then(() => self.skipWaiting()));
 });
 self.addEventListener("activate", e => {
   e.waitUntil(caches.keys()
@@ -23,7 +24,7 @@ self.addEventListener("fetch", e => {
     const cached = await cache.match(key, {ignoreSearch: true});
     // オフライン中は通信しない（iPadで「機内モードをオフに…」の案内が出るのを防ぐ）
     const offline = self.navigator && self.navigator.onLine === false;
-    const network = offline ? Promise.resolve(null) : fetch(req).then(res => {
+    const network = offline ? Promise.resolve(null) : fetch(req, {cache: "no-cache"}).then(res => {
       if (res && res.ok && res.type === "basic") cache.put(key, res.clone());
       return res;
     }).catch(() => null);

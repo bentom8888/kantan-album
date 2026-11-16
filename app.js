@@ -1,6 +1,6 @@
 "use strict";
 /*
- かんたん画像アルバム スマホ版 v0.8.0
+ かんたん画像アルバム スマホ版 v0.8.1
  - PC版v0.6.0が作る「スマホで見る.html」をOneDriveから読み取り専用(Files.Read)で取得
  - 取得したHTMLは端末(IndexedDB)に保存し、オフラインでも表示
  - 取得に失敗しても、保存済みのアルバムは消さない
@@ -18,7 +18,9 @@ const K = {
   hint: "kaa.loginHint",        // 前回ログインしたアカウント名（自動再ログイン用）
   pkce: "kaa.pkce",             // ログイン途中の一時データ
   silentAt: "kaa.silentAt",     // 自動再ログインを試した時刻（無限ループ防止）
-  loggedOut: "kaa.loggedOut"
+  loggedOut: "kaa.loggedOut",
+  importing: "kaa.importing",   // 画像の取り込み中の印（v0.8.1）
+  rendering: "kaa.rendering"    // アルバムを組み立て中の印（v0.8.1）
 };
 
 let carriedMsg = "";
@@ -88,10 +90,11 @@ async function imgKeys() {
     r.onsuccess = () => resolve(new Set(r.result)); r.onerror = () => reject(r.error); tx.oncomplete = () => d.close();
   });
 }
-async function imgPut(key, blob) {
+// v0.8.1: iPadのSafariはIndexedDBにBlobを入れると不安定になることがあるため、ArrayBufferで保存する
+async function imgPut(key, buffer, type) {
   const d = await db();
   return new Promise((resolve, reject) => {
-    const tx = d.transaction("images", "readwrite"); tx.objectStore("images").put(blob, key);
+    const tx = d.transaction("images", "readwrite"); tx.objectStore("images").put({buf: buffer, type: type || "image/jpeg"}, key);
     tx.oncomplete = () => { d.close(); resolve(); }; tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error || Error("画像を保存できません（端末の空き容量を確認してください）"));
   });
 }
@@ -99,7 +102,15 @@ async function imgGetMany(keys) {
   const d = await db(); const out = new Map();
   return new Promise((resolve, reject) => {
     const tx = d.transaction("images", "readonly"); const st = tx.objectStore("images");
-    for (const key of keys) { const r = st.get(key); r.onsuccess = () => { if (r.result) out.set(key, r.result); }; }
+    for (const key of keys) {
+      const r = st.get(key);
+      r.onsuccess = () => {
+        const v = r.result;
+        if (!v) return;
+        if (v instanceof Blob) out.set(key, v);                         // v0.8.0で保存した分
+        else if (v.buf) out.set(key, new Blob([v.buf], {type: v.type || "image/jpeg"}));
+      };
+    }
     tx.oncomplete = () => { d.close(); resolve(out); }; tx.onerror = () => reject(tx.error);
   });
 }
@@ -162,8 +173,10 @@ async function displayAsync(value, which) {
   if (rendered) {
     // 画面を読み直す前に、今のお知らせを引き継ぐ（読み直したあとも「○枚を取り込みました」が見えるように）
     try { sessionStorage.setItem("kaa.show", which); sessionStorage.setItem("kaa.msg", $("appStatus").textContent); } catch {}
+    ls(K.rendering, null);
     location.reload(); return;
   }
+  ls(K.rendering, String(Date.now()));
   const data = await buildData(value);
   if (rendered) return;
   const view = window.KAA_VIEW;
@@ -171,6 +184,9 @@ async function displayAsync(value, which) {
   const root = $("albumRoot"); root.innerHTML = view.html; root.hidden = false; $("appHelp").hidden = true;
   view.start(data);
   rendered = true;
+  setTimeout(() => ls(K.rendering, null), 4000);
+  // ふつうに画面を閉じる・読み直すときは「落ちた」とみなさない
+  window.addEventListener("pagehide", () => ls(K.rendering, null));
   shownKey = value.eTag || String(value.at);
   $("appNewBar").hidden = true; pending = null;
 }
@@ -298,6 +314,7 @@ async function sync(reason) {
     if (!shownKey || reason === "launch" || reason === "login" || reason === "manual") { status("最新のアルバムを取り込みました（" + describe(value) + "）"); display(value); }
     else { pending = value; $("appNewBar").hidden = false; status("新しいアルバムを取り込みました。上の「表示する」で切り替えます。"); }
   } catch (err) {
+    ls(K.importing, null);
     status("更新できませんでした：" + err.message + "\n保存済みのアルバムはそのまま見られます。", true);
   } finally {
     syncing = false; $("appRefresh").disabled = false; progress(null); setLoginButton();
@@ -368,6 +385,8 @@ async function syncV2(reason) {
   }
   let notYet = 0;
   if (missing.length) {
+    // 取り込み中にアプリが落ちた場合、次の起動で自動的に取り込みを再開しない（落ちる→再起動の繰り返しを防ぐ）
+    ls(K.importing, String(Date.now()));
     status("新しい画像を確認中…");
     const urls = await listImageFiles(base);
     if (!urls) return "redirect";
@@ -380,9 +399,10 @@ async function syncV2(reason) {
       progress(done / missing.length);
       const r = await fetch(url, {cache: "no-store"});
       if (!r.ok) throw Error("画像を取り込めませんでした（HTTP " + r.status + "）。取り込めた分は保存してあり、次回は続きから取り込みます。");
-      await imgPut(key, await r.blob());
+      await imgPut(key, await r.arrayBuffer(), r.headers.get("content-type") || "image/jpeg");
     }
   }
+  ls(K.importing, null);
   // PCからOneDriveへの同期が途中の画像があるときは、表示中のアルバムをそのまま使う（初回だけは、そろっている分で表示）
   if (notYet && cur) {
     status("PCからOneDriveへの同期がまだの画像が" + notYet + "枚あります。少し待ってから「更新」を押してください。", true);
@@ -442,6 +462,12 @@ async function init() {
     }
     try { carriedMsg = sessionStorage.getItem("kaa.msg") || ""; sessionStorage.removeItem("kaa.msg"); } catch {}
     const cached = await dbGet("latest");
+    if (cached && ls(K.rendering) && !location.search.includes("code=")) {
+      // 前回、表示の途中でアプリが落ちた場合は、自動では表示しない（落ちる→再起動の繰り返しを防ぐ）
+      ls(K.rendering, null);
+      status("前回、アルバムの表示中にアプリが終了しました。「更新」を押すと表示します。", true);
+      return wireResume();
+    }
     if (cached) { await display(cached); status(carriedMsg || ("保存済みのアルバムを表示中（" + describe(cached) + "）")); }
     else status("端末に保存されたアルバムはまだありません。");
   } catch (e) { status("端末の保存データを読めません：" + e.message, true); }
@@ -454,6 +480,10 @@ async function init() {
   if (cb === "needLogin") { status(shownKey ? "ログインが切れました。「ログイン」で最新に更新できます。" : "「ログイン」を押してください。", true); }
   else if (cb === "ok") await sync("login");
   else if (!clientReady()) status("設定が未完了です（config.js のクライアントID）。", true);
+  else if (ls(K.importing)) {
+    ls(K.importing, null);
+    status("前回、画像の取り込み中にアプリが終了しました。続きを取り込むには「更新」を押してください。", true);
+  }
   else if (loggedIn() || (ls(K.hint) && !ls(K.loggedOut))) await sync("launch");
   else if (!shownKey) status("初回は「ログイン」を押してください。");
 
